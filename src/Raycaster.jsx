@@ -213,6 +213,7 @@ const Raycaster = () => {
       const radius = Math.ceil(settingsRef.current.renderDistance);
       const px = Math.floor(p.x);
       const py = Math.floor(p.y);
+      const t = performance.now() / 1000;
 
       for (let y = py - radius; y <= py + radius; y++) {
         for (let x = px - radius; x <= px + radius; x++) {
@@ -221,13 +222,31 @@ const Raycaster = () => {
             const dot = x * 13.333 + y * 77.777;
             const sin = Math.sin(dot) * 43758.5453;
             if (sin - Math.floor(sin) < 0.1) {
+              // Per-light unique seed derived from position
+              const seed = x * 127.1 + y * 311.7;
+
+              // Layered noise for organic fire flicker:
+              // fast jitter + slow swell, each with a unique phase per light
+              const n1 = Math.sin(seed + t * 7.3)  * 0.5 + 0.5;
+              const n2 = Math.sin(seed * 1.7 + t * 3.1) * 0.5 + 0.5;
+              const n3 = Math.sin(seed * 0.9 + t * 13.7) * 0.5 + 0.5;
+              const flicker = n1 * 0.5 + n2 * 0.3 + n3 * 0.2; // 0..1
+
+              // Intensity: flickers between ~40% and 100%
+              const intensityScale = 0.4 + flicker * 0.6;
+
+              // Color: dim = deep orange-red, bright = yellow-white
+              const r = 255;
+              const g = Math.round(80  + flicker * 120); // 80..200
+              const b = Math.round(0   + flicker * 60);  // 0..60
+
               const light = {
                 x: x + 0.5,
                 y: y + 0.5,
-                r: 255,
-                g: 120,
-                b: 20,
-                intensity: 8,
+                r,
+                g,
+                b,
+                intensity: 8 * intensityScale,
               };
               currentLights.push(light);
             }
