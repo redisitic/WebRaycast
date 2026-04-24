@@ -87,7 +87,7 @@ const Raycaster = () => {
 
   useEffect(() => {
     const img = new Image();
-    img.src = "/assets/torch.png";
+    img.src = "./assets/torch.png";
     img.onload = () => {
       const offscreen = document.createElement("canvas");
       offscreen.width = img.width;
@@ -102,7 +102,7 @@ const Raycaster = () => {
     };
 
     const wallImg = new Image();
-    wallImg.src = "/assets/Wall.png";
+    wallImg.src = "./assets/Wall.png";
     wallImg.onload = () => {
       const offscreen = document.createElement("canvas");
       offscreen.width = wallImg.width;
