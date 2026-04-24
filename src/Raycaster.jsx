@@ -51,6 +51,8 @@ const Raycaster = () => {
   const canvasRef = useRef(null);
   const fpsRef = useRef(null);
   const textureDataRef = useRef(null);
+  const torchFramesRef = useRef([]);
+  const torchFrameIndexRef = useRef(0);
   const wallTextureRef = useRef(null);
 
   const [settings, setSettings] = useState({
@@ -82,24 +84,52 @@ const Raycaster = () => {
   });
 
   const lights = useRef([]);
-
   const keys = useRef({});
+  const workersRef = useRef([]);
 
   useEffect(() => {
-    const img = new Image();
-    img.src = "./assets/torch.png";
-    img.onload = () => {
-      const offscreen = document.createElement("canvas");
-      offscreen.width = img.width;
-      offscreen.height = img.height;
-      const ctx = offscreen.getContext("2d");
-      ctx.drawImage(img, 0, 0);
-      textureDataRef.current = {
-        width: img.width,
-        height: img.height,
-        data: ctx.getImageData(0, 0, img.width, img.height).data,
-      };
-    };
+    // Initialize Web Workers
+    const numWorkers = navigator.hardwareConcurrency || 4;
+    for (let i = 0; i < numWorkers; i++) {
+      workersRef.current.push(
+        new Worker(new URL("./renderWorker.js", import.meta.url), {
+          type: "module",
+        }),
+      );
+    }
+
+    const loadTorchFrame = (src) =>
+      new Promise((resolve) => {
+        const img = new Image();
+        img.src = src;
+        img.onload = () => {
+          const offscreen = document.createElement("canvas");
+          offscreen.width = img.width;
+          offscreen.height = img.height;
+          const ctx = offscreen.getContext("2d");
+          ctx.drawImage(img, 0, 0);
+          resolve({
+            width: img.width,
+            height: img.height,
+            data: ctx.getImageData(0, 0, img.width, img.height).data,
+          });
+        };
+      });
+
+    Promise.all([
+      loadTorchFrame("./assets/torch-0.png"),
+      loadTorchFrame("./assets/torch-1.png"),
+    ]).then((frames) => {
+      torchFramesRef.current = frames;
+      textureDataRef.current = frames[0];
+    });
+
+    const torchAnimInterval = setInterval(() => {
+      if (torchFramesRef.current.length === 2) {
+        torchFrameIndexRef.current = (torchFrameIndexRef.current + 1) % 2;
+        textureDataRef.current = torchFramesRef.current[torchFrameIndexRef.current];
+      }
+    }, 250);
 
     const wallImg = new Image();
     wallImg.src = "./assets/Wall.png";
@@ -206,12 +236,13 @@ const Raycaster = () => {
       }
       lights.current = currentLights;
 
+      // Clear previous frame's active tiles
       for (let i = 0; i < activeTileIndices.length; i++) {
         tileLights[activeTileIndices[i]] = null;
       }
       activeTileIndices.length = 0;
 
-      // Pre-compute shadows per tile (O(Tiles * Lights) instead of O(Pixels * Lights))
+      // Assign lights to tiles (Shadows are pre-computed using a single ray per tile)
       for (let i = 0; i < currentLights.length; i++) {
         const light = currentLights[i];
         const lightRadius = 10;
@@ -229,6 +260,7 @@ const Raycaster = () => {
               const d = Math.sqrt(dx * dx + dy * dy) || 1;
 
               // Raycast from the center of the tile to the light
+              // We do this to cull ENTIRE TILES that are hidden by walls
               if (
                 castShadowRay(
                   gx + 0.5 + (dx / d) * bias,
@@ -299,7 +331,12 @@ const Raycaster = () => {
       return true;
     };
 
+    let isRendering = false;
+
     const render = () => {
+      if (isRendering || workersRef.current.length === 0) return;
+      isRendering = true;
+
       const canvas = canvasRef.current;
       const ctx = canvas.getContext("2d");
       const p = player.current;
@@ -316,397 +353,54 @@ const Raycaster = () => {
 
       const colorMask = 256 - (1 << (8 - settingsRef.current.colorBits));
 
-      const buffer = ctx.createImageData(WIDTH, HEIGHT);
-      const buffer32 = new Uint32Array(buffer.data.buffer);
-      const zBuffer = new Float32Array(WIDTH);
+      const numWorkers = workersRef.current.length;
+      const chunkWidth = Math.ceil(WIDTH / numWorkers);
+      let completed = 0;
+      const pendingChunks = [];
 
-      for (let y = 0; y < HEIGHT; y++) {
-        const rayDirX0 = p.dirX - p.planeX;
-        const rayDirY0 = p.dirY - p.planeY;
-        const rayDirX1 = p.dirX + p.planeX;
-        const rayDirY1 = p.dirY + p.planeY;
+      for (let i = 0; i < numWorkers; i++) {
+        const startX = i * chunkWidth;
+        let curChunkWidth = chunkWidth;
+        if (startX + curChunkWidth > WIDTH) curChunkWidth = WIDTH - startX;
 
-        const isFloor = y > HEIGHT / 2;
-        const horizonPos = isFloor ? y - HEIGHT / 2 : HEIGHT / 2 - y;
+        if (curChunkWidth <= 0) {
+          completed++;
+          continue;
+        }
 
-        if (horizonPos === 0) continue;
+        workersRef.current[i].onmessage = (e) => {
+          const { buffer, startX: sx, chunkWidth: cw } = e.data;
+          pendingChunks.push({ buffer, sx, cw });
 
-        const camZ = 0.5 * HEIGHT;
-        const rowDistance = camZ / horizonPos;
-
-        const floorStepX = (rowDistance * (rayDirX1 - rayDirX0)) / WIDTH;
-        const floorStepY = (rowDistance * (rayDirY1 - rayDirY0)) / WIDTH;
-
-        let floorX = p.x + rowDistance * rayDirX0;
-        let floorY = p.y + rowDistance * rayDirY0;
-
-        for (let x = 0; x < WIDTH; x++) {
-          const cellX = Math.floor(floorX);
-          const cellY = Math.floor(floorY);
-
-          let r = 0,
-            g = 0,
-            b = 0;
-          let baseR = 50,
-            baseG = 50,
-            baseB = 50;
-
-          if (isFloor) {
-            const tileScale = 3;
-            const isDark =
-              (Math.floor(floorX * tileScale) +
-                Math.floor(floorY * tileScale)) %
-                2 ===
-              0;
-            const val = isDark ? 20 : 200;
-            baseR = val;
-            baseG = val;
-            baseB = val;
-          } else {
-            baseR = 50;
-            baseG = 50;
-            baseB = 50;
-          }
-
-          const idxCell =
-            (cellY + CACHE_OFFSET) * MAX_CACHE + (cellX + CACHE_OFFSET);
-          if (idxCell >= 0 && idxCell < tileLights.length) {
-            const cellLights = tileLights[idxCell];
-            if (cellLights !== null) {
-              for (let i = 0; i < cellLights.length; i++) {
-                const light = cellLights[i];
-                const dx = light.x - floorX;
-                const dy = light.y - floorY;
-                const distSq = dx * dx + dy * dy;
-                const falloff =
-                  (light.intensity * settingsRef.current.lightMultiplier) /
-                  (distSq + 1);
-                r += light.r * falloff;
-                g += light.g * falloff;
-                b += light.b * falloff;
-              }
+          completed++;
+          if (completed === numWorkers) {
+            // Flush all strips to the canvas in one atomic batch so the
+            // browser never composites a mix of old and new frame strips,
+            // which would cause the "vertical jello" on floor/ceiling.
+            for (const chunk of pendingChunks) {
+              ctx.putImageData(
+                new ImageData(new Uint8ClampedArray(chunk.buffer), chunk.cw, HEIGHT),
+                chunk.sx,
+                0,
+              );
             }
+            isRendering = false;
           }
+        };
 
-          r += baseR * settingsRef.current.ambientLight;
-          g += baseG * settingsRef.current.ambientLight;
-          b += baseB * settingsRef.current.ambientLight;
-
-          const depthFog = Math.max(
-            0,
-            1 - rowDistance / settingsRef.current.fogDistance,
-          );
-
-          const finalR =
-            (Math.min(255, Math.max(0, r * depthFog)) & colorMask) | 0;
-          const finalG =
-            (Math.min(255, Math.max(0, g * depthFog)) & colorMask) | 0;
-          const finalB =
-            (Math.min(255, Math.max(0, b * depthFog)) & colorMask) | 0;
-
-          buffer32[y * WIDTH + x] =
-            (255 << 24) | (finalB << 16) | (finalG << 8) | finalR;
-
-          floorX += floorStepX;
-          floorY += floorStepY;
-        }
+        workersRef.current[i].postMessage({
+          chunkWidth: curChunkWidth,
+          startX,
+          WIDTH,
+          HEIGHT,
+          player: p,
+          lights: lights.current,
+          settings: settingsRef.current,
+          colorMask,
+          textureData: textureDataRef.current,
+          wallTexture: wallTextureRef.current,
+        });
       }
-
-      for (let x = 0; x < WIDTH; x++) {
-        const cameraX = (2 * x) / WIDTH - 1;
-        const rayDirX = p.dirX + p.planeX * cameraX;
-        const rayDirY = p.dirY + p.planeY * cameraX;
-
-        let mapX = Math.floor(p.x);
-        let mapY = Math.floor(p.y);
-        const deltaDistX = Math.abs(1 / rayDirX);
-        const deltaDistY = Math.abs(1 / rayDirY);
-
-        let stepX, stepY, sideDistX, sideDistY;
-        if (rayDirX < 0) {
-          stepX = -1;
-          sideDistX = (p.x - mapX) * deltaDistX;
-        } else {
-          stepX = 1;
-          sideDistX = (mapX + 1.0 - p.x) * deltaDistX;
-        }
-        if (rayDirY < 0) {
-          stepY = -1;
-          sideDistY = (p.y - mapY) * deltaDistY;
-        } else {
-          stepY = 1;
-          sideDistY = (mapY + 1.0 - p.y) * deltaDistY;
-        }
-
-        let hit = 0,
-          side;
-        let distanceTraveled = 0;
-        while (
-          hit === 0 &&
-          distanceTraveled < settingsRef.current.renderDistance
-        ) {
-          if (sideDistX < sideDistY) {
-            sideDistX += deltaDistX;
-            mapX += stepX;
-            side = 0;
-            distanceTraveled = sideDistX - deltaDistX;
-          } else {
-            sideDistY += deltaDistY;
-            mapY += stepY;
-            side = 1;
-            distanceTraveled = sideDistY - deltaDistY;
-          }
-          if (getWall(mapX, mapY)) hit = 1;
-        }
-
-        if (hit === 0) continue;
-
-        const perpWallDist =
-          side === 0 ? sideDistX - deltaDistX : sideDistY - deltaDistY;
-        zBuffer[x] = perpWallDist;
-
-        const lineHeight = Math.floor(HEIGHT / perpWallDist);
-        const drawStart = Math.max(0, Math.floor(-lineHeight / 2 + HEIGHT / 2));
-        const drawEnd = Math.min(
-          HEIGHT - 1,
-          Math.floor(lineHeight / 2 + HEIGHT / 2) + 1,
-        );
-
-        const hitX = p.x + perpWallDist * rayDirX;
-        const hitY = p.y + perpWallDist * rayDirY;
-
-        const normX = side === 0 ? -stepX : 0;
-        const normY = side === 1 ? -stepY : 0;
-
-        let texX = 0;
-        let wallX = 0;
-        let wallTex = null;
-
-        if (wallTextureRef.current) {
-          wallTex = wallTextureRef.current;
-          if (side === 0) wallX = p.y + perpWallDist * rayDirY;
-          else wallX = p.x + perpWallDist * rayDirX;
-          wallX -= Math.floor(wallX);
-
-          texX = Math.floor(wallX * wallTex.width);
-          if (side === 0 && rayDirX > 0) texX = wallTex.width - texX - 1;
-          if (side === 1 && rayDirY < 0) texX = wallTex.width - texX - 1;
-        }
-
-        let l_r = 0,
-          l_g = 0,
-          l_b = 0;
-        for (const light of lights.current) {
-          const lx = light.x - hitX;
-          const ly = light.y - hitY;
-          const lDist = Math.sqrt(lx * lx + ly * ly);
-
-          if (lDist === 0) continue;
-
-          const lDirX = lx / lDist;
-          const lDirY = ly / lDist;
-
-          const nDotL = Math.max(0, lDirX * normX + lDirY * normY);
-
-          if (nDotL > 0) {
-            if (
-              castShadowRay(
-                hitX + normX * 0.001,
-                hitY + normY * 0.001,
-                light.x,
-                light.y,
-              )
-            ) {
-              const falloff =
-                (light.intensity * settingsRef.current.lightMultiplier) /
-                (lDist * lDist + 1);
-              l_r += light.r * falloff * nDotL;
-              l_g += light.g * falloff * nDotL;
-              l_b += light.b * falloff * nDotL;
-            }
-          }
-        }
-
-        l_r += 255 * settingsRef.current.ambientLight;
-        l_g += 255 * settingsRef.current.ambientLight;
-        l_b += 255 * settingsRef.current.ambientLight;
-
-        const depthFog = Math.max(
-          0,
-          1 - perpWallDist / settingsRef.current.fogDistance,
-        );
-
-        const step = (wallTex ? wallTex.height : 1.0) / lineHeight;
-        let texPos = (drawStart - HEIGHT / 2 + lineHeight / 2) * step;
-
-        for (let y = drawStart; y <= drawEnd; y++) {
-          if (y >= HEIGHT) continue;
-
-          let baseR = 150,
-            baseG = 150,
-            baseB = 150;
-          if (wallTex) {
-            const texY = Math.floor(texPos) & (wallTex.height - 1);
-            texPos += step;
-
-            const texIdx = (texY * wallTex.width + texX) * 4;
-            baseR = wallTex.data[texIdx];
-            baseG = wallTex.data[texIdx + 1];
-            baseB = wallTex.data[texIdx + 2];
-          }
-
-          const finalR =
-            (Math.min(255, Math.max(0, ((baseR * l_r) / 255) * depthFog)) &
-              colorMask) |
-            0;
-          const finalG =
-            (Math.min(255, Math.max(0, ((baseG * l_g) / 255) * depthFog)) &
-              colorMask) |
-            0;
-          const finalB =
-            (Math.min(255, Math.max(0, ((baseB * l_b) / 255) * depthFog)) &
-              colorMask) |
-            0;
-
-          buffer32[y * WIDTH + x] =
-            (255 << 24) | (finalB << 16) | (finalG << 8) | finalR;
-        }
-      }
-
-      if (textureDataRef.current) {
-        const tex = textureDataRef.current;
-
-        const spriteOrder = [];
-        const spriteDistance = [];
-
-        for (let i = 0; i < lights.current.length; i++) {
-          spriteOrder[i] = i;
-          spriteDistance[i] =
-            (p.x - lights.current[i].x) ** 2 + (p.y - lights.current[i].y) ** 2;
-        }
-
-        spriteOrder.sort((a, b) => spriteDistance[b] - spriteDistance[a]);
-
-        for (let i = 0; i < lights.current.length; i++) {
-          const light = lights.current[spriteOrder[i]];
-
-          if (
-            Math.sqrt(spriteDistance[spriteOrder[i]]) >
-            settingsRef.current.renderDistance
-          )
-            continue;
-
-          const spriteX = light.x - p.x;
-          const spriteY = light.y - p.y;
-
-          // Transform sprite with the inverse camera matrix
-          // [ planeX   dirX ] -1                                       [ dirY      -dirX ]
-          // [               ]       =  1/(planeX*dirY-dirX*planeY) *   [                 ]
-          // [ planeY   dirY ]                                          [ -planeY  planeX ]
-
-          const invDet = 1.0 / (p.planeX * p.dirY - p.dirX * p.planeY);
-
-          const transformX = invDet * (p.dirY * spriteX - p.dirX * spriteY);
-          const transformY =
-            invDet * (-p.planeY * spriteX + p.planeX * spriteY);
-
-          if (transformY <= 0) continue;
-          const spriteScreenX = Math.floor(
-            (WIDTH / 2) * (1 + transformX / transformY),
-          );
-
-          // Sprite sizing (respecting texture aspect ratio)
-          const aspectRatio = tex.height / tex.width;
-
-          const wallHeight = Math.abs(Math.floor(HEIGHT / transformY));
-
-          const scale = 0.6;
-          const spriteHeight = Math.floor(wallHeight * scale);
-          const spriteWidth = Math.floor(spriteHeight / aspectRatio);
-
-          const floorY = Math.floor(HEIGHT / 2 + wallHeight / 2);
-
-          let drawStartY = floorY - spriteHeight;
-          if (drawStartY < 0) drawStartY = 0;
-          let drawEndY = floorY;
-          if (drawEndY >= HEIGHT) drawEndY = HEIGHT - 1;
-
-          let drawStartX = Math.floor(-spriteWidth / 2 + spriteScreenX);
-          if (drawStartX < 0) drawStartX = 0;
-          let drawEndX = Math.floor(spriteWidth / 2 + spriteScreenX);
-          if (drawEndX >= WIDTH) drawEndX = WIDTH - 1;
-
-          for (let stripe = drawStartX; stripe < drawEndX; stripe++) {
-            const texX = Math.floor(
-              ((stripe - (-spriteWidth / 2 + spriteScreenX)) * tex.width) /
-                spriteWidth,
-            );
-
-            if (
-              transformY > 0 &&
-              stripe > 0 &&
-              stripe < WIDTH &&
-              transformY < zBuffer[stripe]
-            ) {
-              for (let y = drawStartY; y < drawEndY; y++) {
-                const dy = y - (floorY - spriteHeight);
-                const texY = Math.floor((dy * tex.height) / spriteHeight);
-
-                if (
-                  texY < 0 ||
-                  texY >= tex.height ||
-                  texX < 0 ||
-                  texX >= tex.width
-                )
-                  continue;
-
-                const texIdx =
-                  (Math.floor(texY) * tex.width + Math.floor(texX)) * 4;
-
-                const a = tex.data[texIdx + 3];
-                if (a > 0) {
-                  const baseR = tex.data[texIdx];
-                  const baseG = tex.data[texIdx + 1];
-                  const baseB = tex.data[texIdx + 2];
-
-                  const fogScale = Math.max(
-                    0,
-                    1 - transformY / settingsRef.current.fogDistance,
-                  );
-
-                  const lightMult = settingsRef.current.lightMultiplier;
-                  const r =
-                    (Math.min(
-                      255,
-                      Math.max(0, baseR * fogScale + light.r * 0.8 * lightMult),
-                    ) &
-                      colorMask) |
-                    0;
-                  const g =
-                    (Math.min(
-                      255,
-                      Math.max(0, baseG * fogScale + light.g * 0.8 * lightMult),
-                    ) &
-                      colorMask) |
-                    0;
-                  const b =
-                    (Math.min(
-                      255,
-                      Math.max(0, baseB * fogScale + light.b * 0.8 * lightMult),
-                    ) &
-                      colorMask) |
-                    0;
-
-                  buffer32[y * WIDTH + stripe] =
-                    (255 << 24) | (b << 16) | (g << 8) | r;
-                }
-              }
-            }
-          }
-        }
-      }
-
-      ctx.putImageData(buffer, 0, 0);
     };
 
     let timeoutId;
@@ -752,6 +446,7 @@ const Raycaster = () => {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
       clearTimeout(timeoutId);
+      clearInterval(torchAnimInterval);
     };
   }, []);
 
